@@ -318,11 +318,13 @@ local function start(b, boot, recover)
     fn = function() return inner("recover") end
   elseif boot then
     local startup = b.files["startup"]
-    if not startup or not startup:find('shell.run("hubbuild", "boot")', 1, true) then
-      error("bot " .. b.id .. " has no working startup file: " .. tostring(startup))
+    local hasState = b.files["hubbuild.state"] or b.files["hubbuild.state.new"]
+    if startup and startup:find('shell.run("hubbuild", "boot")', 1, true) then
+      local inner = fn
+      fn = function() return inner("boot") end
+    elseif hasState then
+      error("bot " .. b.id .. " has progress saved but no working startup file: " .. tostring(startup))
     end
-    local inner = fn
-    fn = function() return inner("boot") end
   end
   b.co = coroutine.create(fn)
 end

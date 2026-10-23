@@ -578,6 +578,7 @@ local function freshStart()
   if not turtle.detect() then
     error("Put me right next to the tin Ender Chest, facing it, then run me again.", 0)
   end
+  installStartup()
   local k
   for kk = 0, 3 do
     local x, z = rotate(DOCK_X, DOCK_Z, kk)
@@ -596,7 +597,6 @@ local function freshStart()
     say("No GPS fix; I'll count my moves.")
   end
   save()
-  installStartup()
   say(string.format("I'm the %s turtle (facing %s). Starting.", SIDE_NAME[st.side], HEADING_NAME[f]))
 end
 
