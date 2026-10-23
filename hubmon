@@ -33,7 +33,10 @@ local function draw()
       local age = math.floor(os.clock() - b.seen)
       line(y, string.format("%-5s %-8s %3d%%  layer %s  fuel %s  %s%s", side, b.label, pct, tostring(b.layer or "-"),
         tostring(b.fuel), b.phase, b.paused and " PAUSED" or ""))
-      line(y + 1, string.format("      at %d,%d,%d  seen %ds ago", b.x, b.y, b.z, age))
+      local warn = ""
+      if b.phase == "crashed" then warn = "  CRASHED, see its screen"
+      elseif age > 60 and b.phase ~= "done" then warn = "  SILENT: chunk unloaded or stopped?" end
+      line(y + 1, string.format("      at %d,%d,%d  seen %ds ago%s", b.x, b.y, b.z, age, warn))
       line(y + 2, "      " .. (b.msg or ""))
     else
       line(y, string.format("%-5s (no news yet)", side))

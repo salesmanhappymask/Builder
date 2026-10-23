@@ -2,6 +2,7 @@ local args = { ... }
 local VERSION = "1.0"
 local PROTOCOL = "hubbuild"
 local STATE_FILE, LOG_FILE = "hubbuild.state", "hubbuild.log"
+local STATE_NEW = STATE_FILE .. ".new"
 
 local HUB, HALL = 7, 2
 local ROOM_HALF, ROOM_IN, ROOM_OUT = 15, 31, 49
@@ -49,19 +50,33 @@ local function say(msg)
 end
 
 local function save()
-  local h = fs.open(STATE_FILE, "w")
+  local h = fs.open(STATE_NEW, "w")
   h.write(textutils.serialize(st))
   h.close()
+  if fs.exists(STATE_FILE) then fs.delete(STATE_FILE) end
+  fs.move(STATE_NEW, STATE_FILE)
+end
+
+local function readState(name)
+  if not fs.exists(name) then return nil end
+  local h = fs.open(name, "r")
+  if not h then return nil end
+  local text = h.readAll()
+  h.close()
+  local ok, s = pcall(textutils.unserialize, text or "")
+  if ok and type(s) == "table" and s.pos and s.k then return s end
+  return nil
 end
 
 local function loadState()
-  if not fs.exists(STATE_FILE) then return false end
-  local h = fs.open(STATE_FILE, "r")
-  local s = textutils.unserialize(h.readAll())
-  h.close()
-  if type(s) ~= "table" or not s.pos or not s.k then return false end
+  local s = readState(STATE_FILE) or readState(STATE_NEW)
+  if not s then return false end
   st, pos = s, s.pos
   return true
+end
+
+local function hasState()
+  return fs.exists(STATE_FILE) or fs.exists(STATE_NEW)
 end
 
 local function rotate(x, z, k)
@@ -254,10 +269,19 @@ local function step(dir)
   end
   st.pend = { fuel = turtle.getFuelLevel(), x = nx, y = ny, z = nz }
   save()
+  local detect = turtle.detect
+  if dir == "up" then detect = turtle.detectUp elseif dir == "down" then detect = turtle.detectDown end
   local since = os.clock()
   while not move() do
     if os.clock() - since > 15 then
-      tell(string.format("Something is in my way at %d,%d,%d. I can't dig, please clear it.", nx, ny, nz))
+      local side = dir == "up" and "top" or dir == "down" and "bottom" or "front"
+      if peripheral.getType(side) == "turtle" then
+        tell(string.format("Another turtle is in my way at %d,%d,%d. Waiting.", nx, ny, nz))
+      elseif detect() then
+        tell(string.format("A block is in my way at %d,%d,%d. I can't dig, please clear it.", nx, ny, nz))
+      else
+        tell(string.format("Can't move to %d,%d,%d and nothing is there. Chunk not loaded? Waiting.", nx, ny, nz))
+      end
       since = os.clock()
     end
     sleep(0.5)
@@ -531,16 +555,20 @@ end
 
 local function installStartup()
   local me = shell and shell.getRunningProgram() or "hubbuild"
+  local line = 'shell.run("' .. me .. '", "boot")'
   if fs.exists("startup") then
     local h = fs.open("startup", "r")
-    local s = h.readAll()
+    local s = h.readAll() or ""
     h.close()
-    if s:find(me, 1, true) then return end
-    say("There's already a startup file, so I won't resume by myself after a reboot. Run " .. me .. " again then.")
-    return
+    if s:find(line, 1, true) then return end
+    if not s:find(me, 1, true) then
+      if fs.exists("startup.old") then fs.delete("startup.old") end
+      fs.move("startup", "startup.old")
+      say("Moved your old startup file to startup.old.")
+    end
   end
   local h = fs.open("startup", "w")
-  h.writeLine('shell.run("' .. me .. '")')
+  h.writeLine(line)
   h.close()
 end
 
@@ -573,16 +601,21 @@ local function freshStart()
 end
 
 local function resume()
-  local gx, gy, gz = nil, nil, nil
-  if st.origin then gx, gy, gz = locate() end
-  if gx then
-    pos.x, pos.y, pos.z = gx - st.origin.x, gy - st.origin.y, gz - st.origin.z
-  elseif st.pend then
+  if st.pend then
     if turtle.getFuelLevel() == st.pend.fuel - 1 then
       pos.x, pos.y, pos.z = st.pend.x, st.pend.y, st.pend.z
     end
   end
   st.pend = nil
+  if st.origin then
+    local gx, gy, gz = locate()
+    if gx then
+      local ex, ey, ez = pos.x + st.origin.x, pos.y + st.origin.y, pos.z + st.origin.z
+      if gx ~= ex or gy ~= ey or gz ~= ez then
+        say(string.format("GPS says %d,%d,%d but by my count I'm at %d,%d,%d. Going by my count; check the GPS hosts' coordinates.", gx, gy, gz, ex, ey, ez))
+      end
+    end
+  end
   local f = readFacing()
   if not f then error("No Dizzy (compass) upgrade found. I need it to know which way I face.", 0) end
   pos.f = f
@@ -644,38 +677,195 @@ local function printStatus()
   print(string.format("at %d,%d,%d facing %s, fuel %s", pos.x, pos.y, pos.z, HEADING_NAME[pos.f], tostring(turtle.getFuelLevel())))
 end
 
+local function printLog()
+  if not fs.exists(LOG_FILE) then
+    print("No log yet.")
+    return
+  end
+  local lines = {}
+  local h = fs.open(LOG_FILE, "r")
+  while true do
+    local l = h.readLine()
+    if not l then break end
+    lines[#lines + 1] = l
+    if #lines > 12 then table.remove(lines, 1) end
+  end
+  h.close()
+  for _, l in ipairs(lines) do print(l) end
+end
+
+local LAYER_NAMES = { [0] = "the floor", "tin wall layer 1", "tin wall layer 2", "glass wall layer 3",
+  "glass wall layer 4", "glass wall layer 5", "the roof" }
+
+local function readLogInfo()
+  local lastDone, side = nil, nil
+  if fs.exists(LOG_FILE) then
+    local h = fs.open(LOG_FILE, "r")
+    while true do
+      local l = h.readLine()
+      if not l then break end
+      local i = l:match("Layer %-?%d+ done %((%d+)/%d+%)")
+      if i then lastDone = tonumber(i) end
+      local sd = l:match("I'm the (%a+) turtle")
+      if sd then side = sd end
+    end
+    h.close()
+  end
+  return lastDone, side
+end
+
+local function describe(i)
+  local s = plan[i]
+  if s.kind == "seal" then return "sealing my start spot" end
+  return LAYER_NAMES[s.y] or ("layer " .. s.y)
+end
+
+local function recover()
+  findPeripherals()
+  local f = readFacing()
+  if not f then
+    printError("No Dizzy (compass) upgrade found.")
+    return false
+  end
+  for slot = 1, 16 do
+    if turtle.getItemCount(slot) > 0 then
+      printError("Empty my inventory first: put the blocks back in their chests.")
+      return false
+    end
+  end
+  local k
+  for kk = 0, 3 do
+    local x, z = rotate(DOCK_X, DOCK_Z, kk)
+    if x == -DX[f] and z == -DZ[f] then k = kk end
+  end
+  local lastDone, side = readLogInfo()
+  if side and side ~= SIDE_NAME[k] then
+    printError("My log says I'm the " .. side .. " turtle, but I'm facing " .. HEADING_NAME[f] ..
+      ". Put me back on the " .. side .. " side of the chests, facing them.")
+    return false
+  end
+  st = { k = k, side = k, i = 1, phase = "tin", slots = {}, pos = { x = -DX[f], y = 0, z = -DZ[f], f = f } }
+  pos = st.pos
+  buildPlan(k == 0)
+  local sealAt
+  for i, s in ipairs(plan) do
+    if s.kind == "seal" then sealAt = i end
+  end
+  local start = math.min((lastDone or 0) + 1, #plan)
+  if lastDone then
+    print(string.format("My log says I finished step %d of %d. Next: %s.", lastDone, #plan, describe(start)))
+  else
+    print("My log doesn't say how far I got.")
+  end
+  print("Press Enter to carry on from there, or type the layer to start from")
+  print("(0 floor, 1-2 tin walls, 3-5 glass walls, 6 roof):")
+  local answer = read()
+  if answer ~= "" then
+    local n = tonumber(answer)
+    if not n or n < 0 or n > ROOF or n % 1 ~= 0 then
+      printError("That isn't a layer from 0 to " .. ROOF .. ".")
+      return false
+    end
+    for i, s in ipairs(plan) do
+      if s.y == n and not s.kind then
+        start = i
+        break
+      end
+    end
+  end
+  local sealed = start > sealAt
+  if sealed then
+    print("I should be on top of my filled-in start spot, facing the GLASS chest.")
+  else
+    print("I should be on my start spot on the ground, facing the TIN chest.")
+  end
+  if not turtle.detect() then
+    printError("There's no chest in front of me.")
+    return false
+  end
+  print("Is that where I am? (y/n)")
+  if read():lower():sub(1, 1) ~= "y" then
+    print("Put me there and run hubbuild recover again.")
+    return false
+  end
+  st.i = start
+  st.phase = sealed and "glass" or "tin"
+  pos.y = sealed and 1 or 0
+  local gx, gy, gz = locate()
+  if gx then st.origin = { x = gx - pos.x, y = gy - pos.y, z = gz - pos.z } end
+  save()
+  installStartup()
+  say(string.format("Recovered: I'm the %s turtle, starting at step %d (%s).", SIDE_NAME[k], start, describe(start)))
+  return true
+end
+
+local function main(booting)
+  findPeripherals()
+  if loadState() then
+    buildPlan(st.k == 0)
+    if st.phase == "done" then
+      print("My part of the build is already done. (hubbuild reset to start over.)")
+      return
+    end
+    if booting then
+      print("Starting up; carrying on in 5 seconds.")
+      sleep(5)
+      findPeripherals()
+    end
+    installStartup()
+    resume()
+  elseif hasState() then
+    printError("My progress file is damaged. Run hubbuild log to see where I was, then hubbuild reset.")
+    return
+  else
+    if booting then return end
+    freshStart()
+    buildPlan(st.k == 0)
+  end
+  waitForFuel(10)
+  if modemSide then
+    parallel.waitForAny(work, listen)
+  else
+    say("No wireless modem; working without status messages.")
+    work()
+  end
+end
+
 if args[1] == "count" then
   printCounts()
   return
 elseif args[1] == "status" then
   printStatus()
   return
+elseif args[1] == "log" then
+  printLog()
+  return
 elseif args[1] == "reset" then
   if fs.exists(STATE_FILE) then fs.delete(STATE_FILE) end
+  if fs.exists(STATE_NEW) then fs.delete(STATE_NEW) end
   print("Forgot my progress. Put me next to the tin Ender Chest, facing it, and run me again.")
   return
-elseif args[1] ~= nil then
-  print("Usage: hubbuild [count|status|reset]")
+elseif args[1] == "recover" then
+  if not recover() then return end
+elseif args[1] ~= nil and args[1] ~= "boot" then
+  print("Usage: hubbuild [count|status|log|recover|reset]")
   return
 end
 
-findPeripherals()
-if loadState() then
-  buildPlan(st.k == 0)
-  if st.phase == "done" then
-    print("My part of the build is already done. (hubbuild reset to start over.)")
+local ok, err = pcall(main, args[1] == "boot")
+if not ok then
+  if err == "Terminated" then
+    print("Stopped. Run hubbuild to carry on.")
     return
   end
-  resume()
-else
-  freshStart()
-  buildPlan(st.k == 0)
-end
-waitForFuel(10)
-
-if modemSide then
-  parallel.waitForAny(work, listen)
-else
-  say("No wireless modem; working without status messages.")
-  work()
+  if not st then
+    printError(err)
+    return
+  end
+  say("Crashed: " .. tostring(err))
+  st.phase = st.phase == "done" and "done" or "crashed"
+  pcall(report, true)
+  print("Restarting in 30 seconds. Hold Ctrl+T to stop me.")
+  sleep(30)
+  os.reboot()
 end

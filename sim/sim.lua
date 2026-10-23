@@ -2,6 +2,8 @@ local PROGRAM = arg[1] or "hubbuild"
 local SEED = tonumber(arg[2] or 1)
 local KILL_CHANCE = tonumber(arg[3] or 0.0005)
 local USE_GPS = arg[4] ~= "nogps"
+local BAD_GPS = arg[4] == "badgps"
+local RECOVER = arg[4] == "recover"
 math.randomseed(SEED)
 
 local source = assert(io.open(PROGRAM)):read("*a")
@@ -207,6 +209,11 @@ local function env(b)
   fsT.exists = function(p) return b.files[p] ~= nil end
   fsT.getSize = function(p) return #(b.files[p] or "") end
   fsT.delete = function(p) b.files[p] = nil end
+  fsT.move = function(a, c)
+    if b.files[c] then error("file exists: " .. c) end
+    b.files[c] = b.files[a]
+    b.files[a] = nil
+  end
   fsT.open = function(p, mode)
     if mode == "r" then
       if not b.files[p] then return nil end
@@ -222,10 +229,14 @@ local function env(b)
       }
     end
     local buf = mode == "a" and (b.files[p] or "") or ""
+    b.files[p] = buf
     return {
       write = function(s) buf = buf .. s end,
       writeLine = function(s) buf = buf .. s .. "\n" end,
-      close = function() b.files[p] = buf end,
+      close = function()
+        if math.random() < KILL_CHANCE then coroutine.yield("kill") end
+        b.files[p] = buf
+      end,
     }
   end
   E.fs = fsT
@@ -241,6 +252,7 @@ local function env(b)
     clock = function() return clock end,
     getComputerLabel = function() return "bot" .. b.id end,
     getComputerID = function() return b.id end,
+    reboot = function() coroutine.yield("kill") end,
     queueEvent = function() end,
     pullEvent = function(filter)
       if filter == "hubbuild_yield" then return filter end
@@ -252,6 +264,11 @@ local function env(b)
     repeat tick() until clock >= untilT
   end
   E.print = function(s) b.log[#b.log + 1] = tostring(s) end
+  E.read = function()
+    b.reads = (b.reads or 0) + 1
+    return b.reads % 2 == 1 and "" or "y"
+  end
+  E.printError = E.print
   E.error = error
   E.peripheral = {
     getType = function(side)
@@ -272,20 +289,41 @@ local function env(b)
     locate = function()
       tick()
       if not USE_GPS then return nil end
+      if BAD_GPS and math.random() < 0.5 then return b.x + ORIGIN.x + math.random(-3, 3), b.y + ORIGIN.y, b.z + ORIGIN.z + 2 end
       return b.x + ORIGIN.x, b.y + ORIGIN.y, b.z + ORIGIN.z
     end,
   }
   E.shell = { getRunningProgram = function() return "hubbuild" end }
   E.parallel = { waitForAny = function(a) a() end }
-  for _, n in ipairs({ "math", "string", "table", "ipairs", "pairs", "type", "tostring", "tonumber", "pcall", "select", "unpack", "next", "setmetatable", "getmetatable" }) do
+  for _, n in ipairs({ "math", "string", "table", "ipairs", "pairs", "type", "tostring", "tonumber", "select", "unpack", "next", "setmetatable", "getmetatable" }) do
     E[n] = _G[n]
+  end
+  E.pcall = function(f, ...)
+    local co = coroutine.create(f)
+    local res = { coroutine.resume(co, ...) }
+    while true do
+      if not res[1] then return false, res[2] end
+      if coroutine.status(co) == "dead" then return true, unpack(res, 2) end
+      res = { coroutine.resume(co, coroutine.yield(unpack(res, 2))) }
+    end
   end
   return E
 end
 
-local function start(b)
+local function start(b, boot, recover)
   local fn = assert(loadstring(source, "hubbuild"))
   setfenv(fn, env(b))
+  if recover then
+    local inner = fn
+    fn = function() return inner("recover") end
+  elseif boot then
+    local startup = b.files["startup"]
+    if not startup or not startup:find('shell.run("hubbuild", "boot")', 1, true) then
+      error("bot " .. b.id .. " has no working startup file: " .. tostring(startup))
+    end
+    local inner = fn
+    fn = function() return inner("boot") end
+  end
   b.co = coroutine.create(fn)
 end
 
@@ -294,6 +332,22 @@ bots[2] = makeBot(2, 0, 1, 3)
 bots[3] = makeBot(3, -1, 0, 0)
 bots[4] = makeBot(4, 0, -1, 1)
 for _, b in ipairs(bots) do start(b) end
+
+local recoverAt = { [3] = 300, [2] = 1300 }
+local function wreck(b)
+  b.files["hubbuild.state"] = nil
+  b.files["hubbuild.state.new"] = nil
+  b.inv = {}
+  local dx, dz = -DX[b.f], -DZ[b.f]
+  turtleAt[key(b.x, b.y, b.z)] = nil
+  local hx, hz = ({ 1, 0, -1, 0 })[b.id], ({ 0, 1, 0, -1 })[b.id]
+  b.x, b.z = hx, hz
+  b.y = blockAt(hx, 0, hz) and 1 or 0
+  b.f = ({ 2, 3, 0, 1 })[b.id]
+  turtleAt[key(b.x, b.y, b.z)] = b
+  stats.recovered = (stats.recovered or 0) + 1
+  start(b, false, true)
+end
 
 local rounds = 0
 while true do
@@ -308,13 +362,21 @@ while true do
         os.exit(1)
       elseif why == "kill" then
         stats.kills = stats.kills + 1
-        start(b)
+        start(b, true)
       elseif coroutine.status(b.co) == "dead" then
         b.done = true
       end
     end
   end
   if alive == 0 then break end
+  if RECOVER then
+    for id, t in pairs(recoverAt) do
+      if clock >= t and not bots[id].done then
+        recoverAt[id] = nil
+        wreck(bots[id])
+      end
+    end
+  end
   rounds = rounds + 1
   if rounds % 20 == 0 then
     keepStocked(tinChest, "tin", 6)
@@ -381,6 +443,8 @@ for _, b in ipairs(bots) do
 end
 print(string.format("placed tin %d, glass %d; footprint x %d..%d z %d..%d (%dx%d); sealed interior air %d",
   placed.tin, placed.glass, minX, maxX, minZ, maxZ, maxX - minX + 1, maxZ - minZ + 1, interior))
+print(string.format("recovered %d", stats.recovered or 0))
+for _, b in ipairs(bots) do for _, l in ipairs(b.log) do if l:find("Recovered", 1, true) then print("bot " .. b.id .. ": " .. l) end end end
 print(string.format("seed %d, gps %s, restarts %d, turtle-turtle blocks %d, sim time %.0f s, lava used %d",
   SEED, tostring(USE_GPS), stats.kills, stats.blocked, clock, stats.lavaIn))
 if errors > 0 then print(errors .. " problems"); os.exit(1) end

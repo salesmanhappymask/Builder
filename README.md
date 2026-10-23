@@ -111,8 +111,10 @@ local r = http.get("https://raw.githubusercontent.com/salesmanhappymask/Builder/
 If old Java on the server can't reach GitHub, copy the file over on a floppy disk instead, or use
 pastebin.
 
-**Chunk loading:** turtles stop working when their chunk unloads. The rooms are 49 blocks from the
-middle, so stand near the hub with a render distance of at least 5 chunks, or use chunk loaders.
+**Chunk loading:** turtles stop working when their chunk unloads, and MoarPeripherals has no chunk
+loader. The rooms are 49 blocks from the middle, so stay near the hub while they work, or use chunk
+loaders from another mod covering the whole 99 x 99 area. A turtle in a loaded chunk that tries to
+move into an unloaded one waits and says so ("Chunk not loaded?") until it can move again.
 
 ## How the build goes
 
@@ -136,15 +138,38 @@ fuel chest whenever it's below what the rest of its job needs.
 ## Restarts and GPS
 
 The turtle saves its progress before every move and installs a `startup` file, so it carries on by
-itself after a reboot, a chunk reload or a server restart.
+itself after a reboot, a chunk reload or a server restart. When it starts from `startup` it waits 5
+seconds first. The progress file is written to a new file and then swapped in, so a turtle that
+shuts down in the middle of a save still has the last good copy. If the program crashes, the turtle
+shows the error, writes it to its log, waits 30 seconds and reboots to try again (hold Ctrl+T to stop
+it).
 
 - **Facing** always comes from the Dizzy Turtle's compass (`getFacing()`), so it can never be lost.
-- **Position** comes from GPS if a GPS fix was possible when the turtle started. The turtle records
-  where the tin chest is in GPS coordinates and works out its own position from that after a reboot.
-- **Without GPS** it counts its moves like the SkylineCity turtles do: it saves the move it's about to
+- **Position** comes from counting moves, like the SkylineCity turtles: it saves the move it's about to
   make together with its fuel level, and after a reboot fuel that's one lower means the move happened.
+- **GPS** is only used as a check. If GPS disagrees with the turtle's count after a reboot, the
+  turtle keeps going by its count and writes the difference in its log, which usually means a GPS
+  host was set up with the wrong coordinates.
 
 Keep the GPS computers above the build, at least 9 blocks over the ground.
+
+If a turtle is stopped and its screen shows no error, open it (right click). Opening a computer
+that's switched off starts it, and it carries on from `startup`.
+
+### Recovering a turtle that lost its progress
+
+Versions before this one could lose their progress file if the chunk unloaded during a save. They'd
+then show "Put me right next to the tin Ender Chest" and stop. To get one going again:
+
+1. Download the new `hubbuild` onto it.
+2. Take everything out of its inventory and put the blocks back in their chests.
+3. Pick it up and put it back on **the same side** of the chests it started on, facing them:
+   - If its start spot is still open (it hasn't finished the tin yet): on the ground, facing the tin
+     chest.
+   - If its start spot is filled with tin: on top of that block, facing the glass chest.
+4. Run `hubbuild recover`. It reads its log to find the last layer it finished, tells you, and asks
+   you to confirm. You can type a layer number instead (0 floor, 1 and 2 tin walls, 3 to 5 glass
+   walls, 6 roof). It redoes that whole layer, skipping every spot that already has a block.
 
 Don't move a turtle by hand while it runs. To start one over: `hubbuild reset`, put it back next to
 the tin chest facing it, and run `hubbuild` again. It skips any spot that already has a block in it.
@@ -156,6 +181,8 @@ the tin chest facing it, and run `hubbuild` again. It skips any spot that alread
 | `hubbuild` | Starts the build, or carries on after a reboot |
 | `hubbuild status` | Which turtle this is, how far along it is, where it is, its fuel |
 | `hubbuild count` | Blocks needed per turtle and for the whole build |
+| `hubbuild log` | The last lines of this turtle's log |
+| `hubbuild recover` | Gets a turtle going again after it lost its progress (see above) |
 | `hubbuild reset` | Forgets this turtle's progress |
 
 Each turtle keeps a log in `hubbuild.log`.
@@ -163,7 +190,8 @@ Each turtle keeps a log in `hubbuild.log`.
 ## Watching the build
 
 `hubmon` runs on any computer with a wireless modem (and an optional monitor next to it). It shows
-every turtle's progress, layer, fuel, position and latest message. Press `p` to pause all turtles
+every turtle's progress, layer, fuel, position and latest message. A turtle that hasn't been heard
+from for a minute is marked SILENT, and one whose program crashed is marked CRASHED. Press `p` to pause all turtles
 (each stops after its current block), `r` to resume, `q` to quit.
 
 The turtles send their status on rednet protocol `hubbuild` every 15 seconds and whenever something
@@ -191,11 +219,13 @@ layers are tin). Use the same file on all four turtles, keep `ROOM_OUT` at 49 or
 
 `sim/sim.lua` runs all four turtles against a fake CC 1.63 world: the Ender Chests get refilled now
 and then (with an outage in the middle), lava pumps refill the returned buckets, and turtles are killed
-at random moments and rebooted. At the end it checks every block's material, that the footprint fits
+at random moments (including in the middle of saving) and rebooted through their `startup` file.
+`badgps` makes GPS give wrong answers half the time. `recover` wipes two turtles' progress partway
+through and brings them back with `hubbuild recover`. At the end it checks every block's material, that the footprint fits
 in 99 x 99, that no air from outside reaches the inside, and that every turtle finished.
 
 ```
-lua5.1 sim/sim.lua hubbuild [seed] [restart chance per action] [nogps]
+lua5.1 sim/sim.lua hubbuild [seed] [restart chance per action] [nogps|badgps|recover]
 lua5.1 sim/sim.lua hubbuild 5 0.005 nogps
 ```
 
