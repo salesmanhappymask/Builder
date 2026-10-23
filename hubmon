@@ -1,0 +1,71 @@
+local PROTOCOL = "hubbuild"
+
+local modemSide, mon
+for _, side in ipairs({ "left", "right", "top", "bottom", "front", "back" }) do
+  local t = peripheral.getType(side)
+  if t == "modem" and not modemSide then modemSide = side end
+  if t == "monitor" and not mon then mon = peripheral.wrap(side) end
+end
+if not modemSide then error("Attach a wireless modem.", 0) end
+rednet.open(modemSide)
+
+local out = mon or term
+if mon and mon.setTextScale then mon.setTextScale(0.5) end
+
+local bots = {}
+local order = { "north", "east", "south", "west" }
+
+local function line(y, text)
+  out.setCursorPos(1, y)
+  out.clearLine()
+  out.write(text)
+end
+
+local function draw()
+  out.clear()
+  line(1, "Hub build   [p] pause all  [r] resume all  [q] quit")
+  local y = 3
+  for _, side in ipairs(order) do
+    local b = bots[side]
+    if b then
+      local pct = b.total > 0 and math.floor((b.step - 1) * 100 / b.total) or 0
+      if b.phase == "done" then pct = 100 end
+      local age = math.floor(os.clock() - b.seen)
+      line(y, string.format("%-5s %-8s %3d%%  layer %s  fuel %s  %s%s", side, b.label, pct, tostring(b.layer or "-"),
+        tostring(b.fuel), b.phase, b.paused and " PAUSED" or ""))
+      line(y + 1, string.format("      at %d,%d,%d  seen %ds ago", b.x, b.y, b.z, age))
+      line(y + 2, "      " .. (b.msg or ""))
+    else
+      line(y, string.format("%-5s (no news yet)", side))
+    end
+    y = y + 4
+  end
+end
+
+local function send(cmd)
+  rednet.broadcast({ kind = "command", cmd = cmd }, PROTOCOL)
+end
+
+send("ping")
+draw()
+local timer = os.startTimer(1)
+while true do
+  local e = { os.pullEvent() }
+  if e[1] == "rednet_message" and type(e[3]) == "table" and e[3].kind == "status" then
+    local m = e[3]
+    m.seen = os.clock()
+    bots[m.side] = m
+    draw()
+  elseif e[1] == "char" then
+    if e[2] == "p" then send("pause")
+    elseif e[2] == "r" then send("resume")
+    elseif e[2] == "q" then
+      out.clear()
+      out.setCursorPos(1, 1)
+      return
+    end
+  elseif e[1] == "timer" and e[2] == timer then
+    draw()
+    timer = os.startTimer(5)
+  end
+end

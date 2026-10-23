@@ -1,0 +1,681 @@
+local args = { ... }
+local VERSION = "1.0"
+local PROTOCOL = "hubbuild"
+local STATE_FILE, LOG_FILE = "hubbuild.state", "hubbuild.log"
+
+local HUB, HALL = 7, 2
+local ROOM_HALF, ROOM_IN, ROOM_OUT = 15, 31, 49
+local LINK = 40
+local HEIGHT, TIN_WALLS = 5, 2
+local ROOF = HEIGHT + 1
+
+local TIN, GLASS = "tin", "glass"
+local NAMES = { tin = "Tin Decoration Block (590:4)", glass = "Thickened Glass (4095)" }
+local LEVEL = { tin = 0, glass = 1, fuel = 2 }
+local DOCK_X, DOCK_Z = 1, 0
+local FUEL_SLOT = 16
+local RESERVE = 60
+local MIN_TRIP = 400
+local REPORT_EVERY = 15
+
+local DX = { [0] = 1, 0, -1, 0 }
+local DZ = { [0] = 0, 1, 0, -1 }
+local HEADING = { east = 0, south = 1, west = 2, north = 3 }
+local HEADING_NAME = { [0] = "east", "south", "west", "north" }
+local SIDE_NAME = { [0] = "east", "south", "west", "north" }
+
+local st, pos
+local compass, modemSide
+local paused = false
+local lastReport = -1e9
+local lastMsg = ""
+
+local function say(msg)
+  print(msg)
+  lastMsg = msg
+  if fs.exists(LOG_FILE) and fs.getSize(LOG_FILE) > 16000 then
+    local h = fs.open(LOG_FILE, "r")
+    local keep = h.readAll():sub(-8000)
+    h.close()
+    h = fs.open(LOG_FILE, "w")
+    h.write(keep)
+    h.close()
+  end
+  local h = fs.open(LOG_FILE, "a")
+  if h then
+    h.writeLine(string.format("[day %d %s] %s", os.day(), textutils.formatTime(os.time(), true), msg))
+    h.close()
+  end
+end
+
+local function save()
+  local h = fs.open(STATE_FILE, "w")
+  h.write(textutils.serialize(st))
+  h.close()
+end
+
+local function loadState()
+  if not fs.exists(STATE_FILE) then return false end
+  local h = fs.open(STATE_FILE, "r")
+  local s = textutils.unserialize(h.readAll())
+  h.close()
+  if type(s) ~= "table" or not s.pos or not s.k then return false end
+  st, pos = s, s.pos
+  return true
+end
+
+local function rotate(x, z, k)
+  for _ = 1, k % 4 do x, z = -z, x end
+  return x, z
+end
+
+local inside
+do
+  local rects = {}
+  local function addArm(x1, z1, x2, z2)
+    for k = 0, 3 do
+      local ax, az = rotate(x1, z1, k)
+      local bx, bz = rotate(x2, z2, k)
+      rects[#rects + 1] = { math.min(ax, bx), math.min(az, bz), math.max(ax, bx), math.max(az, bz) }
+    end
+  end
+  addArm(-HUB, -HUB, HUB, HUB)
+  addArm(-HALL, -ROOM_IN, HALL, -HUB)
+  addArm(-ROOM_HALF, -ROOM_OUT, ROOM_HALF, -ROOM_IN)
+  addArm(ROOM_HALF, -LINK - HALL, LINK + HALL, -LINK + HALL)
+  addArm(LINK - HALL, -LINK - HALL, LINK + HALL, -ROOM_HALF)
+  local grid = {}
+  for _, r in ipairs(rects) do
+    for x = r[1], r[3] do
+      grid[x] = grid[x] or {}
+      for z = r[2], r[4] do grid[x][z] = true end
+    end
+  end
+  inside = function(x, z) return grid[x] ~= nil and grid[x][z] == true end
+end
+
+local function isWall(x, z)
+  if not inside(x, z) then return false end
+  for dx = -1, 1 do
+    for dz = -1, 1 do
+      if not inside(x + dx, z + dz) then return true end
+    end
+  end
+  return false
+end
+
+local function yield()
+  os.queueEvent("hubbuild_yield")
+  os.pullEvent("hubbuild_yield")
+end
+
+local plan
+
+local function buildPlan(withOriginCap)
+  plan = {}
+  local cx, cz = DOCK_X, DOCK_Z
+  local function addLayer(y, m, test)
+    local cells = {}
+    for z = 0, ROOM_OUT do
+      for x = 1, ROOM_OUT do
+        if test(x, z) and not (x == DOCK_X and z == DOCK_Z and (y == 0 or y == ROOF)) then
+          cells[#cells + 1] = { x, z }
+        end
+      end
+    end
+    local used, n = {}, #cells
+    for done = 1, n do
+      local best, bestD = nil, math.huge
+      for j = 1, n do
+        if not used[j] then
+          local d = math.abs(cells[j][1] - cx) + math.abs(cells[j][2] - cz)
+          if d < bestD then best, bestD = j, d end
+        end
+      end
+      used[best] = true
+      cx, cz = cells[best][1], cells[best][2]
+      plan[#plan + 1] = { x = cx, y = y, z = cz, m = m }
+      if done % 150 == 0 then yield() end
+    end
+  end
+  addLayer(0, TIN, inside)
+  for y = 1, TIN_WALLS do addLayer(y, TIN, isWall) end
+  plan[#plan + 1] = { x = DOCK_X, y = 0, z = DOCK_Z, m = TIN, kind = "seal" }
+  for y = TIN_WALLS + 1, HEIGHT do addLayer(y, GLASS, isWall) end
+  addLayer(ROOF, GLASS, inside)
+  if withOriginCap then plan[#plan + 1] = { x = 0, y = ROOF, z = 0, m = GLASS, kind = "via" } end
+  plan[#plan + 1] = { x = DOCK_X, y = ROOF, z = DOCK_Z, m = GLASS, kind = "cap" }
+end
+
+local function fuel()
+  local f = turtle.getFuelLevel()
+  if f == "unlimited" then return math.huge end
+  return f
+end
+
+local function fuelLimit()
+  local l = turtle.getFuelLimit and turtle.getFuelLimit() or 20000
+  if l == "unlimited" then return math.huge end
+  return l
+end
+
+local function report(force)
+  if not modemSide then return end
+  if not force and os.clock() - lastReport < REPORT_EVERY then return end
+  lastReport = os.clock()
+  local s = plan and plan[st.i]
+  rednet.broadcast({
+    kind = "status", label = os.getComputerLabel() or ("turtle " .. os.getComputerID()),
+    side = SIDE_NAME[st.side], step = st.i, total = plan and #plan or 0, layer = s and s.y,
+    x = pos.x, y = pos.y, z = pos.z, fuel = turtle.getFuelLevel(), phase = st.phase,
+    paused = paused, msg = lastMsg, version = VERSION,
+  }, PROTOCOL)
+end
+
+local function tell(msg)
+  say(msg)
+  report(true)
+end
+
+local function counts()
+  local c = {}
+  for s = 1, 16 do c[s] = turtle.getItemCount(s) end
+  return c
+end
+
+local function count(m)
+  local n = 0
+  for s = 1, 16 do
+    if st.slots[s] == m then n = n + turtle.getItemCount(s) end
+  end
+  return n
+end
+
+local function slotOf(m)
+  for s = 1, 16 do
+    if st.slots[s] == m and turtle.getItemCount(s) > 0 then return s end
+  end
+  return nil
+end
+
+local function tidySlots()
+  for s = 1, 16 do
+    if turtle.getItemCount(s) == 0 then st.slots[s] = nil end
+  end
+end
+
+local function waitForFuel(n)
+  while fuel() < n do
+    for s = 1, 16 do
+      if not st.slots[s] and turtle.getItemCount(s) > 0 then
+        turtle.select(s)
+        turtle.refuel()
+      end
+    end
+    if fuel() >= n then break end
+    tell("I'm out of fuel. Put a lava bucket in my inventory.")
+    os.pullEvent("turtle_inventory")
+  end
+end
+
+local function checkPause()
+  if not paused then return end
+  save()
+  tell("Paused.")
+  while paused do
+    sleep(1)
+    report(false)
+  end
+  tell("Resumed.")
+end
+
+local function turnTo(f)
+  while pos.f ~= f do
+    if (pos.f + 1) % 4 == f then
+      turtle.turnRight()
+      pos.f = f
+    else
+      turtle.turnLeft()
+      pos.f = (pos.f + 3) % 4
+    end
+  end
+end
+
+local function step(dir)
+  waitForFuel(1)
+  local move = turtle.forward
+  local nx, ny, nz = pos.x, pos.y, pos.z
+  if dir == "up" then
+    move, ny = turtle.up, ny + 1
+  elseif dir == "down" then
+    move, ny = turtle.down, ny - 1
+  else
+    nx, nz = nx + DX[pos.f], nz + DZ[pos.f]
+  end
+  st.pend = { fuel = turtle.getFuelLevel(), x = nx, y = ny, z = nz }
+  save()
+  local since = os.clock()
+  while not move() do
+    if os.clock() - since > 15 then
+      tell(string.format("Something is in my way at %d,%d,%d. I can't dig, please clear it.", nx, ny, nz))
+      since = os.clock()
+    end
+    sleep(0.5)
+    waitForFuel(1)
+    st.pend.fuel = turtle.getFuelLevel()
+  end
+  pos.x, pos.y, pos.z = nx, ny, nz
+  st.pend = nil
+  if fuel() == math.huge then save() end
+end
+
+local function moveX(x)
+  if pos.x ~= x then turnTo(x > pos.x and 0 or 2) end
+  while pos.x ~= x do step("forward") end
+end
+
+local function moveZ(z)
+  if pos.z ~= z then turnTo(z > pos.z and 1 or 3) end
+  while pos.z ~= z do step("forward") end
+end
+
+local function moveY(y)
+  while pos.y < y do step("up") end
+  while pos.y > y do step("down") end
+end
+
+local function goTo(lx, ly, lz)
+  local wx, wz = rotate(lx, lz, st.k)
+  if ly > pos.y then moveY(ly) end
+  if st.k % 2 == 0 then
+    moveX(wx)
+    moveZ(wz)
+  else
+    moveZ(wz)
+    moveX(wx)
+  end
+  if ly < pos.y then moveY(ly) end
+end
+
+local function faceChest()
+  turnTo((2 + st.k) % 4)
+end
+
+local function toLocal(x, z)
+  return rotate(x, z, 4 - st.k % 4)
+end
+
+local function distanceTo(lx, ly, lz)
+  local x, z = toLocal(pos.x, pos.z)
+  return math.abs(x - lx) + math.abs(pos.y - ly) + math.abs(z - lz)
+end
+
+local function remaining(m)
+  local n = 0
+  for i = st.i, #plan do
+    if plan[i].m == m then n = n + 1 end
+  end
+  return n
+end
+
+local function freeSlot()
+  tidySlots()
+  if turtle.getItemCount(FUEL_SLOT) == 0 then return FUEL_SLOT end
+  for s = 1, 15 do
+    if turtle.getItemCount(s) == 0 then return s end
+  end
+  return nil
+end
+
+local function fuelTarget()
+  return math.min(fuelLimit() - 1000, math.floor((#plan - st.i + 1) * 1.5) + 800)
+end
+
+local function refuel()
+  if fuel() == math.huge then return end
+  save()
+  local target = fuelTarget()
+  local tries = 0
+  while fuel() < target and tries < 40 do
+    tries = tries + 1
+    local s = freeSlot()
+    if not s then break end
+    turtle.select(s)
+    st.slots[s] = nil
+    if turtle.suck() then
+      while turtle.getItemCount(s) > 0 and fuel() < target and turtle.refuel(1) do end
+    elseif fuel() >= MIN_TRIP then
+      break
+    else
+      tell("Waiting for lava buckets in the fuel Ender Chest.")
+      sleep(10)
+    end
+  end
+  for s = 1, 16 do
+    if not st.slots[s] and turtle.getItemCount(s) > 0 then
+      turtle.select(s)
+      turtle.drop()
+    end
+  end
+  save()
+end
+
+local function load(m)
+  local waited = false
+  while true do
+    tidySlots()
+    local want = math.ceil((remaining(m) - count(m)) / 64)
+    for s = 1, 15 do
+      if want <= 0 then break end
+      if turtle.getItemCount(s) == 0 then
+        turtle.select(s)
+        local before = counts()
+        if not turtle.suck() then break end
+        for t = 1, 16 do
+          if turtle.getItemCount(t) > before[t] then st.slots[t] = m end
+        end
+        save()
+        want = want - 1
+      end
+    end
+    if count(m) > 0 then
+      if waited then tell("Got " .. NAMES[m] .. ", carrying on.") end
+      return
+    end
+    tell("Waiting for " .. NAMES[m] .. " in its Ender Chest.")
+    waited = true
+    sleep(10)
+  end
+end
+
+local function needsRefuel()
+  return fuel() < fuelTarget() - 1000
+end
+
+local function restock(m)
+  say(string.format("Restocking %s (fuel %s).", m, tostring(turtle.getFuelLevel())))
+  if needsRefuel() then
+    goTo(DOCK_X, LEVEL.fuel, DOCK_Z)
+    faceChest()
+    refuel()
+  end
+  goTo(DOCK_X, LEVEL[m], DOCK_Z)
+  faceChest()
+  load(m)
+  tidySlots()
+  save()
+end
+
+local function placeDown(s)
+  local since = os.clock()
+  while true do
+    local slot = slotOf(s.m)
+    if not slot then return turtle.detectDown() end
+    turtle.select(slot)
+    if turtle.placeDown() then return true end
+    if turtle.detectDown() then
+      if not turtle.compareDown() then
+        local wx, wz = rotate(s.x, s.z, st.k)
+        say(string.format("A block that isn't %s is already at %d,%d,%d; leaving it.", s.m, wx, s.y, wz))
+      end
+      return true
+    end
+    if os.clock() - since > 15 then
+      local wx, wz = rotate(s.x, s.z, st.k)
+      tell(string.format("Can't place at %d,%d,%d (a mob in the way?). Retrying.", wx, s.y, wz))
+      since = os.clock()
+    end
+    sleep(1)
+  end
+end
+
+local function ensureSupplies(s)
+  local tx, tz = s.x, s.z
+  local need = distanceTo(tx, s.y + 1, tz) + math.abs(tx - DOCK_X) + math.abs(tz - DOCK_Z) + s.y + RESERVE
+  if count(s.m) == 0 or fuel() < need then restock(s.m) end
+end
+
+local function sealDock()
+  if not st.sealStage then
+    if needsRefuel() then
+      goTo(DOCK_X, LEVEL.fuel, DOCK_Z)
+      faceChest()
+      refuel()
+    end
+    goTo(DOCK_X, LEVEL.tin, DOCK_Z)
+    faceChest()
+    if count(TIN) == 0 then load(TIN) end
+    local keep = slotOf(TIN)
+    for s = 1, 16 do
+      if st.slots[s] == TIN and turtle.getItemCount(s) > 0 then
+        turtle.select(s)
+        if s == keep then
+          turtle.drop(turtle.getItemCount(s) - 1)
+        else
+          turtle.drop()
+        end
+      end
+    end
+    tidySlots()
+    st.sealStage = 2
+    save()
+  end
+  goTo(DOCK_X, LEVEL.tin + 1, DOCK_Z)
+  if not placeDown(plan[st.i]) then
+    st.sealStage = nil
+    save()
+    return sealDock()
+  end
+  st.sealStage = nil
+  tidySlots()
+  for s = 1, 16 do
+    if st.slots[s] == TIN then
+      say("Leftover tin in slot " .. s .. " (the tin chest is sealed now); keeping it.")
+      st.slots[s] = "spare"
+    end
+  end
+  st.phase = "glass"
+  tell("Floor and tin walls done; my way to the tin chest is sealed. Starting the glass.")
+end
+
+local function work()
+  while st.i <= #plan do
+    checkPause()
+    local s = plan[st.i]
+    if s.kind == "seal" then
+      sealDock()
+    else
+      local placed = false
+      while not placed do
+        ensureSupplies(s)
+        if s.kind == "via" then goTo(DOCK_X, s.y + 1, DOCK_Z) end
+        goTo(s.x, s.y + 1, s.z)
+        placed = placeDown(s)
+      end
+    end
+    if s.y ~= (plan[st.i + 1] and plan[st.i + 1].y) then
+      tell(string.format("Layer %d done (%d/%d).", s.y, st.i, #plan))
+    end
+    st.i = st.i + 1
+    save()
+    report(false)
+  end
+  st.phase = "done"
+  save()
+  tell("My part of the build is done. I'm parked on the roof.")
+end
+
+local function findPeripherals()
+  compass, modemSide = nil, nil
+  for _, side in ipairs({ "left", "right", "top", "bottom", "front", "back" }) do
+    local t = peripheral.getType(side)
+    if t == "compass" and not compass then compass = peripheral.wrap(side) end
+    if t == "modem" and not modemSide then modemSide = side end
+  end
+  if modemSide then rednet.open(modemSide) end
+end
+
+local function readFacing()
+  if not compass then return nil end
+  local ok, f = pcall(compass.getFacing)
+  if ok then return HEADING[f] end
+  return nil
+end
+
+local function locate()
+  if not gps or not modemSide then return nil end
+  local x, y, z = gps.locate(3)
+  if not x then return nil end
+  return math.floor(x + 0.5), math.floor(y + 0.5), math.floor(z + 0.5)
+end
+
+local function installStartup()
+  local me = shell and shell.getRunningProgram() or "hubbuild"
+  if fs.exists("startup") then
+    local h = fs.open("startup", "r")
+    local s = h.readAll()
+    h.close()
+    if s:find(me, 1, true) then return end
+    say("There's already a startup file, so I won't resume by myself after a reboot. Run " .. me .. " again then.")
+    return
+  end
+  local h = fs.open("startup", "w")
+  h.writeLine('shell.run("' .. me .. '")')
+  h.close()
+end
+
+local function freshStart()
+  local f = readFacing()
+  if not f then error("No Dizzy (compass) upgrade found. I need it to know which way I face.", 0) end
+  if not turtle.detect() then
+    error("Put me right next to the tin Ender Chest, facing it, then run me again.", 0)
+  end
+  local k
+  for kk = 0, 3 do
+    local x, z = rotate(DOCK_X, DOCK_Z, kk)
+    if x == -DX[f] and z == -DZ[f] then k = kk end
+  end
+  st = {
+    k = k, side = k, i = 1, phase = "tin", slots = {},
+    pos = { x = -DX[f], y = 0, z = -DZ[f], f = f },
+  }
+  pos = st.pos
+  local gx, gy, gz = locate()
+  if gx then
+    st.origin = { x = gx - pos.x, y = gy - pos.y, z = gz - pos.z }
+    say(string.format("GPS says the tin chest is at %d,%d,%d.", st.origin.x, st.origin.y, st.origin.z))
+  else
+    say("No GPS fix; I'll count my moves.")
+  end
+  save()
+  installStartup()
+  say(string.format("I'm the %s turtle (facing %s). Starting.", SIDE_NAME[st.side], HEADING_NAME[f]))
+end
+
+local function resume()
+  local gx, gy, gz = nil, nil, nil
+  if st.origin then gx, gy, gz = locate() end
+  if gx then
+    pos.x, pos.y, pos.z = gx - st.origin.x, gy - st.origin.y, gz - st.origin.z
+  elseif st.pend then
+    if turtle.getFuelLevel() == st.pend.fuel - 1 then
+      pos.x, pos.y, pos.z = st.pend.x, st.pend.y, st.pend.z
+    end
+  end
+  st.pend = nil
+  local f = readFacing()
+  if not f then error("No Dizzy (compass) upgrade found. I need it to know which way I face.", 0) end
+  pos.f = f
+  tidySlots()
+  for s = 1, 16 do
+    if not st.slots[s] and turtle.getItemCount(s) > 0 then
+      for t = 1, 16 do
+        if st.slots[t] and t ~= s and turtle.getItemCount(t) > 0 then
+          turtle.select(s)
+          if turtle.compareTo(t) then
+            st.slots[s] = st.slots[t]
+            break
+          end
+        end
+      end
+    end
+  end
+  save()
+  say(string.format("Carrying on at step %d of %d from %d,%d,%d.", st.i, #plan, pos.x, pos.y, pos.z))
+end
+
+local function listen()
+  while true do
+    local _, msg = rednet.receive(PROTOCOL)
+    if type(msg) == "table" and msg.kind == "command" then
+      if msg.cmd == "pause" then
+        paused = true
+      elseif msg.cmd == "resume" then
+        paused = false
+      elseif msg.cmd == "ping" then
+        lastReport = -1e9
+      end
+    end
+  end
+end
+
+local function printCounts()
+  local tin, glass, moves = 0, 0, 0
+  buildPlan(true)
+  for _, s in ipairs(plan) do
+    if s.m == TIN then tin = tin + 1 else glass = glass + 1 end
+  end
+  local origin = plan[#plan - 1].kind == "via" and 1 or 0
+  print("Blocks for one turtle (the east one places 1 extra glass):")
+  print(string.format("  tin   %d (%.1f stacks)", tin, tin / 64))
+  print(string.format("  glass %d (%.1f stacks)", glass - origin, (glass - origin) / 64))
+  print("Whole build:")
+  print(string.format("  tin   %d (%.1f stacks)", tin * 4, tin * 4 / 64))
+  print(string.format("  glass %d (%.1f stacks)", (glass - origin) * 4 + 1, ((glass - origin) * 4 + 1) / 64))
+end
+
+local function printStatus()
+  if not loadState() then
+    print("Not started yet.")
+    return
+  end
+  buildPlan(st.k == 0)
+  print(string.format("%s turtle, phase %s, step %d of %d", SIDE_NAME[st.side], st.phase, math.min(st.i, #plan), #plan))
+  print(string.format("at %d,%d,%d facing %s, fuel %s", pos.x, pos.y, pos.z, HEADING_NAME[pos.f], tostring(turtle.getFuelLevel())))
+end
+
+if args[1] == "count" then
+  printCounts()
+  return
+elseif args[1] == "status" then
+  printStatus()
+  return
+elseif args[1] == "reset" then
+  if fs.exists(STATE_FILE) then fs.delete(STATE_FILE) end
+  print("Forgot my progress. Put me next to the tin Ender Chest, facing it, and run me again.")
+  return
+elseif args[1] ~= nil then
+  print("Usage: hubbuild [count|status|reset]")
+  return
+end
+
+findPeripherals()
+if loadState() then
+  buildPlan(st.k == 0)
+  if st.phase == "done" then
+    print("My part of the build is already done. (hubbuild reset to start over.)")
+    return
+  end
+  resume()
+else
+  freshStart()
+  buildPlan(st.k == 0)
+end
+waitForFuel(10)
+
+if modemSide then
+  parallel.waitForAny(work, listen)
+else
+  say("No wireless modem; working without status messages.")
+  work()
+end
